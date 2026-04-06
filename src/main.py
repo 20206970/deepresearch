@@ -1,0 +1,289 @@
+"""FastAPI entry point for LangGraph Deep Research"""
+
+import json
+import sys
+import os
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict, Iterator, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from loguru import logger
+from pydantic import BaseModel, Field
+
+from src.config import get_config
+from src.graph.research import get_research_graph
+from src.memory.long_term import create_long_term_memory, search_long_term_memory
+from src.memory.short_term import create_short_term_memory, get_short_term_memory
+
+# 配置日志
+logger.add(
+    sys.stderr,
+    level="INFO",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <4}</level> | <level>{message}</level>",
+    colorize=True,
+)
+
+# 历史记录存储目录（使用绝对路径，基于项目根目录）
+HISTORY_DIR = Path(__file__).parent.parent / "research_history"
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class ResearchRequest(BaseModel):
+    """研究请求"""
+    topic: str = Field(..., description="Research topic")
+    search_api: Optional[str] = Field(default=None, description="Search API override")
+
+
+class ResearchResponse(BaseModel):
+    """研究响应"""
+    report_markdown: str = Field(..., description="Markdown-formatted research report")
+    todo_items: list[dict[str, Any]] = Field(default_factory=list, description="Task items")
+
+
+class HistoryItem(BaseModel):
+    """历史记录"""
+    id: str
+    topic: str
+    report: str
+    tasks: List[dict[str, Any]]
+    created_at: str
+
+
+def _save_history(topic: str, report: str, tasks: List[dict]) -> str:
+    """保存研究历史到文件"""
+    import time
+    history_id = f"research_{int(time.time() * 1000)}"
+    history_data = {
+        "id": history_id,
+        "topic": topic,
+        "report": report,
+        "tasks": tasks,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    file_path = HISTORY_DIR / f"{history_id}.json"
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(history_data, f, ensure_ascii=False, indent=2)
+    return history_id
+
+
+def _get_history_list() -> List[dict]:
+    """获取历史记录列表"""
+    history_list = []
+    for file_path in HISTORY_DIR.glob("*.json"):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                history_list.append({
+                    "id": data.get("id"),
+                    "topic": data.get("topic"),
+                    "created_at": data.get("created_at")
+                })
+        except Exception:
+            continue
+    # 按时间倒序排列
+    history_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return history_list
+
+
+def _get_history(history_id: str) -> Optional[dict]:
+    """获取单条历史记录"""
+    file_path = HISTORY_DIR / f"{history_id}.json"
+    if not file_path.exists():
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _create_plan_only(topic: str) -> dict:
+    """只生成任务规划，不执行完整研究"""
+    from src.agents import create_planner_agent
+    from langchain_openai import ChatOpenAI
+    from src.config import get_config
+
+    config = get_config()
+    llm = ChatOpenAI(
+        model=config.llm.model,
+        base_url=config.llm.base_url,
+        api_key=config.llm.api_key,
+        temperature=config.llm.temperature,
+    )
+    agent = create_planner_agent(llm)
+
+    prompt = f"""当前研究主题：{topic}
+
+请为此主题规划研究任务。"""
+
+    response = agent.invoke({"messages": [("user", prompt)]})
+    output = response.get("messages", [])[-1].content
+
+    # 解析任务
+    import re
+    match = re.search(r'\{[\s\S]*"tasks"[\s\S]*\}', output)
+    tasks = []
+    if match:
+        try:
+            data = json.loads(match.group())
+            tasks = [
+                {
+                    "id": i + 1,
+                    "title": t.get("title", f"任务{i+1}"),
+                    "intent": t.get("intent", ""),
+                    "query": t.get("query", ""),
+                }
+                for i, t in enumerate(data.get("tasks", []))
+            ]
+        except json.JSONDecodeError:
+            pass
+
+    # 如果没有任务，生成一个默认任务
+    if not tasks:
+        tasks = [{
+            "id": 1,
+            "title": "基础背景梳理",
+            "intent": "收集主题的核心背景与最新动态",
+            "query": f"{topic} 最新进展",
+        }]
+
+    # 规划阶段不生成完整报告，只返回空报告
+    return {
+        "report_markdown": "",
+        "todo_items": tasks
+    }
+
+
+def create_app() -> FastAPI:
+    """创建 FastAPI 应用"""
+    app = FastAPI(title="LangGraph Deep Researcher")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.on_event("startup")
+    def init_services():
+        """初始化服务"""
+        config = get_config()
+
+        # 初始化长期记忆
+        create_long_term_memory(
+            persist_directory=config.memory.long_term_persist_dir,
+            k=config.memory.long_term_k,
+        )
+
+        # 初始化短期记忆
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            model=config.llm.model,
+            base_url=config.llm.base_url,
+            api_key=config.llm.api_key,
+        )
+        create_short_term_memory(llm, config.memory.short_term_max_tokens)
+
+        logger.info(f"LangGraph Deep Researcher initialized")
+        logger.info(f"LLM: {config.llm.model} @ {config.llm.base_url}")
+        logger.info(f"ChromaDB: {config.memory.long_term_persist_dir}")
+
+    @app.get("/healthz")
+    def health_check() -> Dict[str, str]:
+        return {"status": "ok"}
+
+    @app.post("/research", response_model=ResearchResponse)
+    def run_research(payload: ResearchRequest) -> ResearchResponse:
+        """同步执行研究"""
+        try:
+            graph = get_research_graph()
+            result = graph.invoke({"topic": payload.topic})
+        except Exception as exc:
+            logger.exception("Research failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        report = result.get("report", "")
+        tasks = result.get("tasks", [])
+
+        # 保存到历史记录
+        _save_history(payload.topic, report, tasks)
+
+        return ResearchResponse(
+            report_markdown=report,
+            todo_items=tasks,
+        )
+
+    @app.get("/history", response_model=List[dict])
+    def get_history():
+        """获取历史研究列表"""
+        logger.info(f"HISTORY_DIR: {HISTORY_DIR}, exists: {HISTORY_DIR.exists()}")
+        result = _get_history_list()
+        logger.info(f"History list: {result}")
+        return result
+
+    @app.get("/history/{history_id}")
+    def get_history_detail(history_id: str):
+        """获取历史研究详情"""
+        history = _get_history(history_id)
+        if not history:
+            raise HTTPException(status_code=404, detail="历史记录不存在")
+        return history
+
+    @app.post("/plan", response_model=ResearchResponse)
+    def create_plan(payload: ResearchRequest) -> ResearchResponse:
+        """只生成任务规划，不保存历史"""
+        try:
+            result = _create_plan_only(payload.topic)
+        except Exception as exc:
+            logger.exception("Planning failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        return ResearchResponse(
+            report_markdown=result["report_markdown"],
+            todo_items=result["todo_items"],
+        )
+
+    @app.post("/research/stream")
+    def stream_research(payload: ResearchRequest) -> StreamingResponse:
+        """流式执行研究"""
+        graph = get_research_graph()
+
+        def event_iterator() -> Iterator[str]:
+            try:
+                for chunk in graph.stream({"topic": payload.topic}):
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            except Exception as exc:
+                logger.exception("Streaming research failed")
+                error_payload = {"type": "error", "detail": str(exc)}
+                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_iterator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+    return app
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info",
+    )
